@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Environment variables
+.env
+.env.*
+
+# Database / cache
+*.sqlite3
+*.db
+nearby_stars_cache.json
+
+# Coverage
+*.coverage
+.coverage.*
+htmlcov/
+
+# Logs & misc
+*.log
+*.pid
+*.bak
+*.swp
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
