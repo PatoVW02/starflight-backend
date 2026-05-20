@@ -1,121 +1,63 @@
 import json
 import logging
+import math
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-import numpy as np
-from astropy.coordinates import SkyCoord
-import astropy.units as u
-from astroquery.simbad import Simbad
-from astroquery.vizier import Vizier
+import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 logger = logging.getLogger("starflight")
 
 CACHE_FILE = Path(__file__).parent / "nearby_stars_cache.json"
-CACHE_VERSION = 2  # increment to invalidate old cache
+CACHE_VERSION = 2
 nearby_stars_cache: list[dict] = []
 
+SIMBAD_TAP = "https://simbad.u-strasbg.fr/simbad/sim-tap/sync"
 
-def _fetch_nearby_stars_from_vizier() -> list[dict]:
-    # Plx > 2 mas  →  distance < 500 pc / ~1630 LY  (~25-35k stars from Hipparcos)
-    v = Vizier(
-        columns=["HIP", "Vmag", "Plx", "RAICRS", "DEICRS", "B-V"],
-        row_limit=-1,
-    )
-    tables = v.query_constraints(catalog="I/239/hip_main", Plx=">2")
-    if not tables:
-        logger.warning("Vizier returned no results for Hipparcos nearby-star query")
-        return []
 
-    table = tables[0]
-    stars = []
-    for row in table:
-        try:
-            plx = float(row["Plx"])
-            if plx <= 0:
-                continue
-
-            distance_pc = 1000.0 / plx
-            distance_ly = distance_pc * 3.26156
-
-            ra_deg = float(row["RAICRS"])
-            dec_deg = float(row["DEICRS"])
-
-            coord = SkyCoord(
-                ra=ra_deg * u.deg,
-                dec=dec_deg * u.deg,
-                distance=distance_ly * u.lyr,
-            )
-
-            vmag = row["Vmag"]
-            bv = row["B-V"]
-
-            stars.append({
-                "id": f"HIP{int(row['HIP'])}",
-                "x": round(float(coord.cartesian.x.to(u.lyr).value), 4),
-                "y": round(float(coord.cartesian.y.to(u.lyr).value), 4),
-                "z": round(float(coord.cartesian.z.to(u.lyr).value), 4),
-                "distance_ly": round(distance_ly, 3),
-                "magnitude": round(float(vmag), 2) if not np.ma.is_masked(vmag) else None,
-                "bv": round(float(bv), 3) if not np.ma.is_masked(bv) else None,
-            })
-        except Exception:
-            continue
-
-    stars.sort(key=lambda s: s["distance_ly"])
-    return stars
+def _ra_dec_to_xyz(ra_deg: float, dec_deg: float, distance_ly: float) -> tuple[float, float, float]:
+    ra = math.radians(ra_deg)
+    dec = math.radians(dec_deg)
+    x = distance_ly * math.cos(dec) * math.cos(ra)
+    y = distance_ly * math.cos(dec) * math.sin(ra)
+    z = distance_ly * math.sin(dec)
+    return x, y, z
 
 
 def _load_cache() -> list[dict]:
     try:
         data = json.loads(CACHE_FILE.read_text())
-        # Support versioned cache; legacy unversioned list is invalidated
         if isinstance(data, dict):
             if data.get("version") != CACHE_VERSION:
-                logger.info("Cache version mismatch — will re-fetch")
+                logger.info("Cache version mismatch — skipping")
                 return []
             return data["stars"]
-        logger.info("Legacy unversioned cache detected — will re-fetch")
         return []
     except Exception:
         return []
 
 
-def _save_cache(stars: list[dict]) -> None:
-    try:
-        CACHE_FILE.write_text(json.dumps({"version": CACHE_VERSION, "stars": stars}))
-    except Exception as e:
-        logger.warning(f"Could not write star cache: {e}")
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global nearby_stars_cache
-    if CACHE_FILE.exists():
-        nearby_stars_cache = _load_cache()
-        if nearby_stars_cache:
-            logger.info(f"Loaded {len(nearby_stars_cache)} nearby stars from cache")
-
-    if not nearby_stars_cache:
-        logger.info("Fetching nearby stars from Vizier/Hipparcos (one-time, may take ~30s)…")
-        nearby_stars_cache = _fetch_nearby_stars_from_vizier()
-        _save_cache(nearby_stars_cache)
-        logger.info(f"Cached {len(nearby_stars_cache)} nearby stars")
+    nearby_stars_cache = _load_cache()
+    if nearby_stars_cache:
+        logger.info(f"Loaded {len(nearby_stars_cache)} nearby stars from cache")
+    else:
+        logger.warning("No star cache found — /stars/nearby will return empty results")
     yield
 
 
 app = FastAPI(lifespan=lifespan)
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-Simbad.add_votable_fields("parallax", "sp_type", "V")
 
 
 @app.get("/stars/nearby/status")
@@ -124,16 +66,23 @@ def nearby_status():
 
 
 @app.get("/stars/nearby")
-def get_nearby_stars(max_distance_ly: float = 1500.0, limit: int = 8000,
-                     cx: float = 0.0, cy: float = 0.0, cz: float = 0.0):
+def get_nearby_stars(
+    max_distance_ly: float = 1500.0,
+    limit: int = 8000,
+    cx: float = 0.0,
+    cy: float = 0.0,
+    cz: float = 0.0,
+):
     if not nearby_stars_cache:
         return {"count": 0, "stars": [], "warning": "Star catalog not yet loaded"}
 
     r2 = max_distance_ly * max_distance_ly
     filtered = []
     for s in nearby_stars_cache:
-        dx = s["x"] - cx; dy = s["y"] - cy; dz = s["z"] - cz
-        if dx*dx + dy*dy + dz*dz <= r2:
+        dx = s["x"] - cx
+        dy = s["y"] - cy
+        dz = s["z"] - cz
+        if dx * dx + dy * dy + dz * dz <= r2:
             filtered.append(s)
 
     result = filtered[:limit]
@@ -141,42 +90,61 @@ def get_nearby_stars(max_distance_ly: float = 1500.0, limit: int = 8000,
 
 
 @app.get("/star/{name}")
-def get_star(name: str):
+async def get_star(name: str):
+    # Escape single quotes for ADQL
+    safe_name = name.replace("'", "''")
+    adql = (
+        "SELECT TOP 1 ra, dec, plx_value, sp_type "
+        "FROM basic JOIN ident ON ident.oidref = basic.oid "
+        f"WHERE ident.id = '{safe_name}'"
+    )
+
     try:
-        result = Simbad.query_object(name)
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(
+                SIMBAD_TAP,
+                params={"REQUEST": "doQuery", "LANG": "ADQL", "FORMAT": "votable/td", "QUERY": adql},
+            )
+            resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"SIMBAD unreachable: {exc}")
 
-        if result is None:
-            raise HTTPException(status_code=404, detail="Star not found")
+    # Parse VOTable with regex — avoids pulling in an XML library for namespace handling
+    text = resp.text
+    fields = re.findall(r'<FIELD[^>]+name="([^"]+)"', text)
+    tr = re.search(r"<TR>(.*?)</TR>", text, re.DOTALL)
+    if not tr or not fields:
+        raise HTTPException(status_code=404, detail="Star not found")
 
-        parallax = result["plx_value"][0]
+    values = re.findall(r"<TD>([^<]*)</TD>", tr.group(1))
+    row = dict(zip(fields, values))
 
-        if np.ma.is_masked(parallax) or parallax <= 0:
-            raise HTTPException(status_code=422, detail="No distance data for this star")
+    try:
+        plx = float(row.get("plx_value") or 0)
+    except ValueError:
+        plx = 0.0
 
-        distance_pc = 1000.0 / parallax
-        distance_ly = distance_pc * 3.26156
+    if plx <= 0:
+        raise HTTPException(status_code=422, detail="No parallax / distance data for this star")
 
-        ra = float(result["ra"][0])
-        dec = float(result["dec"][0])
+    try:
+        ra = float(row["ra"])
+        dec = float(row["dec"])
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=f"Incomplete coordinate data: {exc}")
 
-        coord = SkyCoord(ra=ra, dec=dec, distance=distance_ly, unit=("deg", "deg", "lyr"))
+    distance_pc = 1000.0 / plx
+    distance_ly = distance_pc * 3.26156
+    x, y, z = _ra_dec_to_xyz(ra, dec, distance_ly)
 
-        x = float(coord.cartesian.x.value)
-        y = float(coord.cartesian.y.value)
-        z = float(coord.cartesian.z.value)
-
-        return {
-            "name": name,
-            "ra": ra,
-            "dec": dec,
-            "distance_ly": round(distance_ly, 2),
-            "distance_pc": round(distance_pc, 2),
-            "spectral_type": str(result["sp_type"][0]),
-            "x": round(x, 4),
-            "y": round(y, 4),
-            "z": round(z, 4),
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return {
+        "name": name,
+        "ra": ra,
+        "dec": dec,
+        "distance_ly": round(distance_ly, 2),
+        "distance_pc": round(distance_pc, 2),
+        "spectral_type": row.get("sp_type", ""),
+        "x": round(x, 4),
+        "y": round(y, 4),
+        "z": round(z, 4),
+    }
